@@ -1,0 +1,62 @@
+/* player.tcss */
+
+Screen {
+    layout: grid;
+    grid-size: 2; /* 两列布局 */
+    grid-columns: 1fr 3fr; /* 左侧列表占1份，右侧详情占3份 */
+    background: $surface;
+}
+
+/* 左侧歌单列表 */
+#sidebar {
+    dock: left;
+    width: 30%;
+    height: 100%;
+    background: $panel;
+    border-right: solid $primary;
+    scrollbar-background: $panel;
+    scrollbar-color: $primary;
+}
+
+/* 右侧主控区 */
+#main-view {
+    height: 100%;
+    align: center middle;
+    content-align: center middle;
+}
+
+/* 封面艺术字区域 (ASCII Art) */
+#album-art {
+    height: 50%;
+    width: 100%;
+    border: heavy $secondary;
+    color: $accent;
+    content-align: center middle;
+    margin: 1;
+}
+
+/* 进度条样式 */
+ProgressBar {
+    width: 80%;
+    color: $success;
+}
+
+/* 底部控制栏 */
+#controls {
+    dock: bottom;
+    height: 3;
+    layout: horizontal;
+    align: center middle;
+    background: $boost;
+}
+
+Button {
+    margin: 0 1;
+    background: $primary;
+    color: $text;
+    border: none;
+}
+
+Button:hover {
+    background: $accent;
+}
