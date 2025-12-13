@@ -16,7 +16,6 @@ def scan_covers():
     
     files = list(MUSIC_DIR.glob("*.mp3")) + list(MUSIC_DIR.glob("*.flac"))
     
-    # 找到那个特定的 Hitorie 文件进行测试，或者读取第一个文件
     target_file = None
     for f in files:
         if "5カウントハロー" in f.name:

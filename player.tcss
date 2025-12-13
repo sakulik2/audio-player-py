@@ -1,5 +1,3 @@
-/* player.tcss */
-
 Screen {
     layout: grid;
     grid-size: 2; /* 两列布局 */
