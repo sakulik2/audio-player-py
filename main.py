@@ -227,9 +227,9 @@ class NeonPlayer(App):
     """
 
     BINDINGS = [
-        Binding("space", "toggle_play", "播放/暂停"),
-        Binding("q", "quit", "退出"),
-        Binding("o", "open_cover", "封面") 
+        Binding("space", "toggle_play", "Play"),
+        Binding("q", "quit", "Quit"),
+        Binding("o", "open_cover", "Artworks") 
     ]
 
     current_metadata = reactive({"title": "Waiting...", "artist": "-", "album": "-"})
