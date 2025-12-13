@@ -2,5 +2,4 @@
 *.wav
 *.flac
 *.m4a
-__pycache__/
 *.pyc
