@@ -1,4 +1,4 @@
-## A music player 🎵
+## A music player
 
 A cyberpunk-styled, responsive terminal music player written in Python. It features a real-time spectrum visualizer, high-resolution ASCII cover art rendering, and automatic metadata fetching.
 
