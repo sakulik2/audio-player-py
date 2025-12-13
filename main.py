@@ -64,18 +64,28 @@ class AudioEngine:
         return self.start_offset
 
     def background_analyze(self, path):
+        # 1. 先标记状态，再清空数据，防止 UI 线程读到空数据但状态还是 False
         self.analyzing = True
+        # 给一个小缓冲，让 UI 线程反应过来
+        time.sleep(0.01) 
         self.raw_data = None
         self.fallback_mode = False
+        
         try:
             f = MutagenFile(path)
             if f and hasattr(f, 'info'):
                 self.duration_sec = f.info.length
             
+            # 极速加载
             audio = AudioSegment.from_file(path)
             audio = audio.set_frame_rate(11025).set_channels(1)
             self.frame_rate = 11025
-            self.raw_data = np.frombuffer(audio.raw_data, dtype=np.int16).astype(np.float32)
+            
+            # 生成新数据
+            new_data = np.frombuffer(audio.raw_data, dtype=np.int16).astype(np.float32)
+            
+            # 原子操作赋值（尽可能减少中间状态）
+            self.raw_data = new_data
             
         except Exception:
             self.fallback_mode = True
@@ -83,19 +93,30 @@ class AudioEngine:
             self.analyzing = False
 
     def get_spectrum(self, bars=60):
+        # === [核心修复] ===
+        # 将 self.raw_data 赋值给局部变量 local_data
+        # 即使 self.raw_data 在其他线程被置为 None，local_data 依然引用着原来的数组
+        # 从而保证本函数执行期间数据不会消失
+        local_data = self.raw_data 
+
+        # 1. 加载中状态
         if self.analyzing:
             return [random.randint(1, 2) for _ in range(bars)]
-        if self.fallback_mode or self.raw_data is None:
+            
+        # 2. 检查局部变量是否有效
+        if self.fallback_mode or local_data is None:
             t = time.time()
             return [int(abs(math.sin(t * 3 + i * 0.2)) * 6) + 1 for i in range(bars)]
 
+        # 3. 计算 (全程使用 local_data)
         current_time = self.get_current_time()
         idx = int(current_time * self.frame_rate)
         
-        if idx >= len(self.raw_data): return [0] * bars
+        # 安全检查
+        if idx >= len(local_data): return [0] * bars
         
         end_idx = idx + self.chunk_size
-        chunk = self.raw_data[idx:end_idx]
+        chunk = local_data[idx:end_idx]
         
         if len(chunk) == 0: return [0] * bars
 
