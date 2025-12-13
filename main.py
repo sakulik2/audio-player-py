@@ -3,6 +3,9 @@ import io
 import time
 import random
 import hashlib
+import tempfile
+import threading
+import math
 from pathlib import Path
 
 # UI
@@ -37,16 +40,16 @@ class AudioEngine:
     def __init__(self):
         pygame.mixer.init(frequency=44100)
         self.raw_data = None
-        self.frame_rate = 44100
+        # 默认 11025，防止未加载时计算出错
+        self.frame_rate = 11025 
         self.duration_sec = 0
         self.analyzing = False
         self.start_offset = 0
-        self.current_file = None
+        self.fallback_mode = False
 
     def load_and_play(self, path, start_time=0):
         self.analyzing = True
         self.start_offset = start_time
-        self.current_file = path 
         try:
             pygame.mixer.music.load(path)
             pygame.mixer.music.play(start=start_time)
@@ -54,40 +57,94 @@ class AudioEngine:
             print(f"Play Error: {e}")
 
     def get_current_time(self):
-        if pygame.mixer.music.get_busy():
-            return self.start_offset + (pygame.mixer.music.get_pos() / 1000.0)
-        return self.start_offset
+        # 增加容错：如果 Pygame 返回 -1 (出错或停止)，则不更新时间
+        pos = pygame.mixer.music.get_pos()
+        if pos < 0: return self.start_offset
+        return self.start_offset + (pos / 1000.0)
 
     def background_analyze(self, path):
+        self.raw_data = None
+        self.fallback_mode = False
         try:
             f = MutagenFile(path)
             if f and hasattr(f, 'info'):
                 self.duration_sec = f.info.length
             
-            # 仅读取前20秒，优化性能
+            # 降采样到 11k 以减少计算压力，同时保留低频特征
             audio = AudioSegment.from_file(path)
-            if len(audio) > 20000: audio = audio[:20000] 
-            self.frame_rate = audio.frame_rate
-            self.raw_data = np.array(audio.set_channels(1).get_array_of_samples())
-        except Exception as e: pass
-        finally: self.analyzing = False
+            audio = audio.set_frame_rate(11025).set_channels(1)
+            
+            self.frame_rate = 11025
+            # 转为 float 类型方便后续数学运算
+            self.raw_data = np.array(audio.get_array_of_samples(), dtype=np.float32)
+            
+        except Exception as e:
+            print(f"Analyze Error: {e}")
+            self.fallback_mode = True
+        finally:
+            self.analyzing = False
 
     def get_spectrum(self, bars=60):
-        if self.raw_data is None or len(self.raw_data) == 0:
-            return [0]*bars
+        # 1. 正在加载或失败时的兜底动画
+        if self.analyzing:
+            return [random.randint(1, 3) for _ in range(bars)]
+        if self.fallback_mode or self.raw_data is None:
+            # 模拟一个正弦波，防止界面空着
+            t = time.time()
+            return [int(abs(math.sin(t * 3 + i * 0.2)) * 6) + 1 for i in range(bars)]
+
+        # 2. 计算当前索引
+        current_time = self.get_current_time()
+        idx = int(current_time * self.frame_rate)
         
-        current_abs = self.get_current_time()
-        display_time = current_abs % 20 
-        idx = int(display_time * self.frame_rate)
-        chunk = 2048
+        # 窗口大小：越大越平滑，越小越灵敏
+        chunk_size = 2048 
         
-        if idx + chunk > len(self.raw_data): return [0]*bars
+        # 安全检查：防止索引越界导致“消失”
+        if idx >= len(self.raw_data):
+            return [0] * bars
         
-        data = np.abs(self.raw_data[idx:idx+chunk])
-        step = len(data) // bars
-        if step == 0: return [0]*bars
-        res = [int(np.mean(data[i*step:(i+1)*step])) for i in range(bars)]
-        return [min(max(x // 100, 1), 8) for x in res]
+        # 截取音频片段
+        end_idx = min(idx + chunk_size, len(self.raw_data))
+        chunk = self.raw_data[idx:end_idx]
+        
+        if len(chunk) == 0: return [0] * bars
+
+        # 3. 核心算法修正：解决“爆表成实心条”的问题
+        # 将片段分成 bars 份
+        step = max(1, len(chunk) // bars)
+        res = []
+        
+        for i in range(bars):
+            start = i * step
+            end = start + step
+            if start >= len(chunk): break
+            
+            # 取该频段的绝对值平均音量
+            segment = chunk[start:end]
+            if len(segment) == 0: 
+                val = 0
+            else:
+                val = np.mean(np.abs(segment))
+            
+            # === 关键修正：非线性映射 ===
+            # 16bit音频最大值约 32768。
+            # 我们先归一化到 0.0 - 1.0
+            normalized = val / 32768.0
+            
+            # 使用平方根函数 (Sqrt) 来提升低音量的可见度，压制高音量
+            # 乘以 2.5 是增益系数，你可以调大这个数让频谱跳得更高
+            height = (normalized ** 0.5) * 20 
+            
+            # 限制在 0-8 之间 (Sparkline 的显示范围)
+            clamped = max(0, min(int(height), 8))
+            res.append(clamped)
+            
+        # 补齐长度（防止数组长度不足报错）
+        while len(res) < bars:
+            res.append(0)
+            
+        return res
 
 class ManualProgressBar(Label):
     def __init__(self, **kwargs):
@@ -138,7 +195,7 @@ class NeonPlayer(App):
     }
 
     #album-art { 
-        height: auto; max-height: 24; width: auto;
+        height: auto; max-height: 22; width: auto;
         border: heavy #333333; margin-bottom: 1; 
         text-align: center; background: #000000; color: #00ff9d;
     }
@@ -168,10 +225,12 @@ class NeonPlayer(App):
 
     BINDINGS = [
         Binding("space", "toggle_play", "播放/暂停"),
-        Binding("q", "quit", "退出")
+        Binding("q", "quit", "退出"),
+        Binding("o", "open_cover", "封面") 
     ]
 
     current_metadata = reactive({"title": "Waiting...", "artist": "-", "album": "-"})
+    current_cover_bytes = None
 
     def __init__(self):
         super().__init__()
@@ -201,6 +260,7 @@ class NeonPlayer(App):
                     yield Button("PREV", id="btn-prev")
                     yield Button("PLAY", id="btn-play")
                     yield Button("NEXT", id="btn-next")
+        yield Footer()
 
     def on_mount(self):
         self.load_files()
@@ -216,6 +276,7 @@ class NeonPlayer(App):
                 lv.append(ListItem(Label(f" {f.name}")))
 
     def update_ui_tick(self):
+        # 频谱现在由 AudioEngine 保证永远返回有效列表
         data = self.audio.get_spectrum(bars=90)
         self.query_one("#spectrum", Sparkline).data = data
 
@@ -277,25 +338,36 @@ class NeonPlayer(App):
             self.query_one("#track-list").index = idx
             self.play_index(idx)
 
+    def action_open_cover(self):
+        if self.current_cover_bytes:
+            threading.Thread(target=self._open_image_file, args=(self.current_cover_bytes,)).start()
+        else:
+            # 使用 Textual 的 notify 显示优雅的提示
+            self.notify("No cover image available", severity="warning")
+
+    def _open_image_file(self, data):
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                tmp.write(data)
+                tmp_path = tmp.name
+            os.startfile(tmp_path)
+        except Exception as e:
+            print(f"Open Error: {e}")
+
     @work(thread=True)
     def process_heavy_tasks(self, path):
+        # 并行执行: 一个线程分析音频，一个提取封面
         self.audio.background_analyze(path)
         self.extract_and_fetch_cover(path)
 
     def extract_and_fetch_cover(self, path):
-        """
-        三级策略:
-        1. 尝试读取本地 ID3 封面
-        2. 如果失败，尝试在线 (iTunes API) 搜索封面
-        3. 如果失败，生成随机 Hash 像素画
-        """
+        self.current_cover_bytes = None 
         try:
             f = MutagenFile(path)
             title = path.stem
             artist = "Unknown"
             album = "-"
             
-            # 1. 提取文本
             if f and f.tags:
                 def get_text(k):
                     if k in f.tags:
@@ -312,7 +384,6 @@ class NeonPlayer(App):
             
             self.current_metadata = {"title": title, "artist": artist, "album": album}
 
-            # 2. 尝试本地封面
             artwork_data = None
             if str(path).lower().endswith(".mp3"):
                 try:
@@ -320,66 +391,46 @@ class NeonPlayer(App):
                     apic_frames = audio_id3.getall("APIC")
                     if apic_frames: artwork_data = apic_frames[0].data
                 except: pass
-
             if not artwork_data and str(path).lower().endswith(".flac"):
                 if hasattr(f, 'pictures') and f.pictures: artwork_data = f.pictures[0].data
 
-            # 3. 如果本地没有，尝试在线获取 (iTunes API)
             if not artwork_data:
                 self.call_from_thread(self.query_one("#album-art").update, "\n\nSearching Online...")
                 artwork_data = self.fetch_online_cover(artist, title)
 
-            # 4. 渲染 (如果找到)
             if artwork_data:
+                self.current_cover_bytes = artwork_data
                 try:
                     img = Image.open(io.BytesIO(artwork_data)).convert("RGB")
-                    # 增加一点对比度，让像素画更清晰
                     enhancer = ImageEnhance.Contrast(img)
                     img = enhancer.enhance(1.2)
                     self.render_high_res_ascii(img)
-                except Exception as e:
-                    print(f"Render Err: {e}")
+                except:
                     self.generate_procedural_art(title)
             else:
-                # 5. 兜底 (Hash Art)
                 self.generate_procedural_art(title)
 
         except Exception as e:
-            print(f"Meta Error: {e}")
             self.generate_procedural_art(path.stem)
 
     def fetch_online_cover(self, artist, title):
-        """利用 iTunes Search API 搜索高清封面"""
         if artist == "Unknown" or not title: return None
-        
         try:
             term = f"{artist} {title}"
             url = "https://itunes.apple.com/search"
-            params = {
-                "term": term,
-                "media": "music",
-                "entity": "song",
-                "limit": 1
-            }
-            # 设置超时防止卡住
+            params = {"term": term, "media": "music", "entity": "song", "limit": 1}
             resp = requests.get(url, params=params, timeout=5)
             data = resp.json()
-            
             if data['resultCount'] > 0:
-                # 获取 100x100 的缩略图链接
                 thumb_url = data['results'][0]['artworkUrl100']
-                # iTunes 的小彩蛋：把链接里的 100x100 换成 600x600 就能拿到高清图
                 hq_url = thumb_url.replace("100x100", "600x600")
-                
                 img_resp = requests.get(hq_url, timeout=5)
                 if img_resp.status_code == 200:
                     return img_resp.content
-        except Exception as e:
-            print(f"Online Fetch Error: {e}")
+        except: pass
         return None
 
     def generate_procedural_art(self, text):
-        """兜底：基于Hash生成随机像素画"""
         seed = int(hashlib.sha256(text.encode('utf-8')).hexdigest(), 16)
         rng = random.Random(seed)
         hex_c = f"#{rng.randint(50,255):02x}{rng.randint(50,255):02x}{rng.randint(50,255):02x}"
@@ -395,14 +446,9 @@ class NeonPlayer(App):
 
     def render_high_res_ascii(self, img):
         try:
-            # 稍微调大一点分辨率以适应容器
             w_char, h_char = 48, 22 
-            
-            # 使用 LANCZOS 滤镜进行高质量缩放
             img = img.resize((w_char, h_char * 2), Image.Resampling.LANCZOS)
             pixels = img.load()
-            
-            # 提取主色
             center_px = img.getpixel((w_char//2, h_char))
             main_color = f"#{center_px[0]:02x}{center_px[1]:02x}{center_px[2]:02x}"
 
@@ -417,9 +463,8 @@ class NeonPlayer(App):
                 textual_str += "\n"
 
             self.call_from_thread(self.update_cover_ui, textual_str, main_color)
-            
-        except Exception as e:
-            self.call_from_thread(self.update_cover_ui, f"\n\n[red]RENDER ERROR[/]", "#ff0000")
+        except:
+            self.call_from_thread(self.update_cover_ui, "[red]RENDER ERR[/]", "#ff0000")
 
     def update_cover_ui(self, art_str, theme_color):
         self.query_one("#album-art").update(art_str)
