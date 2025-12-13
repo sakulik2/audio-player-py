@@ -1,100 +1,154 @@
+import sys
 import os
+import argparse
 from pathlib import Path
 from mutagen import File as MutagenFile
-from mutagen.id3 import ID3, APIC
 
-# --- 你的路径 ---
-MUSIC_DIR = Path("J:\音乐\Hitorie")
-# ----------------
+# -----------------------------------------------------------
+# 辅助函数
+# -----------------------------------------------------------
 
-def hex_head(data):
-    """显示前10个字节的十六进制，用于判断文件头 (如 FF D8 FF 是 JPEG)"""
-    return " ".join("{:02x}".format(c) for c in data[:10])
+def hex_head(data, length=10):
+    """显示二进制数据的前 N 个字节的十六进制表示"""
+    if not data:
+        return "Empty"
+    hex_str = " ".join("{:02x}".format(c) for c in data[:length])
+    return f"[{hex_str}...]"
 
-def scan_covers():
-    print(f"🔍 正在扫描: {MUSIC_DIR} ...\n")
+def get_image_type(data):
+    """根据文件头猜测图片格式"""
+    if data.startswith(b'\xff\xd8\xff'):
+        return "JPEG"
+    elif data.startswith(b'\x89PNG'):
+        return "PNG"
+    elif data.startswith(b'GIF'):
+        return "GIF"
+    elif data.startswith(b'BM'):
+        return "BMP"
+    return "Unknown Binary"
+
+def format_value(key, value, indent="    "):
+    """
+    智能格式化标签值。
+    能够处理：普通字符串、列表、ID3帧对象、二进制图片数据。
+    """
+    val_type = type(value).__name__
     
-    files = list(MUSIC_DIR.glob("*.mp3")) + list(MUSIC_DIR.glob("*.flac"))
+    # 1. 检查是否有二进制数据 (图片/封面)
+    # Mutagen 的图片通常在 data 属性中，或者本身就是 bytes
+    binary_data = None
+    if hasattr(value, 'data') and isinstance(value.data, bytes):
+        binary_data = value.data
+    elif isinstance(value, bytes):
+        # 有些老旧标签可能是纯 bytes，如果不长，视为文本，太长视为二进制
+        if len(value) > 256 or b'\0' in value[:10]: 
+            binary_data = value
+
+    if binary_data:
+        size_kb = len(binary_data) / 1024
+        img_fmt = get_image_type(binary_data)
+        hex_preview = hex_head(binary_data)
+        mime = getattr(value, 'mime', 'N/A')
+        desc = getattr(value, 'desc', 'N/A')
+        type_id = getattr(value, 'type', 'N/A') # ID3 APIC type (3=Cover Front)
+        
+        return (f"\n{indent}📦 [BINARY/IMAGE DETECTED]\n"
+                f"{indent}   Format : {img_fmt}\n"
+                f"{indent}   Size   : {size_kb:.2f} KB\n"
+                f"{indent}   MIME   : {mime}\n"
+                f"{indent}   Desc   : {desc}\n"
+                f"{indent}   PicType: {type_id}\n"
+                f"{indent}   Header : {hex_preview}")
+
+    # 2. 处理 ID3 文本帧 (通常包含 text 属性，且是列表)
+    if hasattr(value, 'text'):
+        # ID3 timestamp objects 等特殊处理
+        return f"{value.text} (ID3 Frame)"
+
+    # 3. 处理列表 (FLAC/Vorbis comments 经常是列表)
+    if isinstance(value, list):
+        return f"{value} (List len={len(value)})"
+
+    # 4. 默认转字符串
+    return str(value)
+
+# -----------------------------------------------------------
+# 主逻辑
+# -----------------------------------------------------------
+
+def inspect_file(file_path):
+    path = Path(file_path)
+    print("="*60)
+    print(f"📂 分析文件: {path.name}")
+    print(f"📍 完整路径: {path.absolute()}")
     
-    target_file = None
-    for f in files:
-        if "5カウントハロー" in f.name:
-            target_file = f
-            break
-    
-    if not target_file and files:
-        target_file = files[0]
-    
-    if not target_file:
-        print("❌ 未找到音乐文件")
+    if not path.exists():
+        print("❌ 文件不存在")
         return
 
-    print(f"📂 目标文件: {target_file.name}")
-    
     try:
-        # 方法 A: 通用 File 读取
-        f = MutagenFile(target_file)
-        print(f"   对象类型: {type(f)}")
+        # 使用 Mutagen 通用加载
+        audio = MutagenFile(path)
         
-        if f.tags:
-            print(f"   Tags 类型: {type(f.tags)}")
+        if not audio:
+            print("❌ Mutagen 无法识别此文件格式 (或非音频文件)")
+            return
             
-            # 1. 遍历所有 Key，寻找含有 'APIC' 或 'Picture' 字样的
-            print("\n   --- [1] 遍历 Key 查找 ---")
-            found_in_keys = False
-            for key in f.tags.keys():
-                key_str = str(key)
-                val = f.tags[key]
-                if "APIC" in key_str or "PIC" in key_str:
-                    found_in_keys = True
-                    print(f"   ✅ 发现疑似封面 Key: '{key_str}'")
-                    print(f"      类型: {type(val)}")
-                    if hasattr(val, 'data'):
-                        print(f"      包含 .data 属性! 大小: {len(val.data)} bytes")
-                        print(f"      文件头: {hex_head(val.data)}")
-                    else:
-                        print("      ❌ 无 .data 属性")
-            if not found_in_keys:
-                print("   ❌ 未在 Keys 中找到 'APIC' 字样")
+        print(f"🧩 Mutagen 对象类型: {type(audio)}")
 
-            # 2. 暴力扫描所有值，寻找二进制数据
-            print("\n   --- [2] 暴力扫描值 (寻找大块二进制) ---")
-            for key, val in f.tags.items():
-                # 检查 .data 属性
-                binary_data = None
-                if hasattr(val, 'data'):
-                    binary_data = val.data
-                elif isinstance(val, bytes):
-                    binary_data = val
-                
-                if binary_data and len(binary_data) > 1000: # 大于 1KB 可能是图片
-                    print(f"   ✅ Key: '{key}' 包含 {len(binary_data)} 字节数据")
-                    print(f"      类型: {type(val)}")
-                    print(f"      文件头: {hex_head(binary_data)}")
-                    if b'\xff\xd8\xff' in binary_data[:10]:
-                        print("      👉 这是一个 JPEG 图片!")
-                    elif b'\x89PNG' in binary_data[:10]:
-                        print("      👉 这是一个 PNG 图片!")
-                    else:
-                        print("      ❓ 未知格式")
+        # --- 第一部分：流信息 (Stream Info) ---
+        print("\n" + "-"*20 + " [音频流信息] " + "-"*20)
+        if audio.info:
+            # 动态遍历 info 对象的所有属性
+            info_attrs = [attr for attr in dir(audio.info) if not attr.startswith("_") and not callable(getattr(audio.info, attr))]
+            for attr in info_attrs:
+                val = getattr(audio.info, attr)
+                # 过滤掉太长的调试信息
+                if isinstance(val, (str, bytes)) and len(val) > 50:
+                    val = f"{str(val)[:50]}..."
+                print(f"{attr:<15}: {val}")
+            
+            # 专门打印直观的时长
+            if hasattr(audio.info, 'length'):
+                m, s = divmod(audio.info.length, 60)
+                print(f"{'Duration':<15}: {int(m)}m {int(s)}s")
+        else:
+            print("   (无流信息)")
 
-        # 方法 B: 强制作为 ID3 读取 (针对 MP3)
-        if target_file.suffix.lower() == ".mp3":
-            print("\n   --- [3] 强制 ID3 模式读取 ---")
-            try:
-                audio = ID3(target_file)
-                # 使用 ID3 专用的 getall 方法
-                apic_frames = audio.getall("APIC")
-                print(f"   audio.getall('APIC') 返回了 {len(apic_frames)} 个帧")
-                if apic_frames:
-                    first = apic_frames[0]
-                    print(f"   第一帧数据大小: {len(first.data)} bytes")
-                    print(f"   MIME: {first.mime}")
-            except Exception as e:
-                print(f"   ID3 读取失败: {e}")
+        # --- 第二部分：元数据标签 (Tags) ---
+        print("\n" + "-"*20 + " [元数据标签] " + "-"*20)
+        
+        if not audio.tags:
+            print("   (无标签数据)")
+        else:
+            print(f"🏷️  Tags 类型: {type(audio.tags)}")
+            count = 0
+            
+            # 获取所有 Keys。有些格式是 dict，有些是类 dict
+            keys = audio.tags.keys()
+            
+            for key in keys:
+                count += 1
+                val = audio.tags[key]
+                formatted_val = format_value(key, val)
+                print(f"🔹 [{key}] : {formatted_val}")
+            
+            print(f"\n✅ 共扫描到 {count} 个标签项")
 
     except Exception as e:
-        print(f"❌ 严重错误: {e}")
+        print(f"❌ 读取错误: {e}")
+        import traceback
+        traceback.print_exc()
+
+def main():
+    parser = argparse.ArgumentParser(description="万能音频元数据查看器 (基于 Mutagen)")
+    parser.add_argument("files", nargs='+', help="要检查的一个或多个音频文件路径")
+    
+    args = parser.parse_args()
+
+    for f in args.files:
+        inspect_file(f)
+        print("\n")
 
 if __name__ == "__main__":
-    scan_covers()
+    main()
