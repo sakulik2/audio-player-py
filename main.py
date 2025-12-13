@@ -18,7 +18,10 @@ from textual.reactive import reactive
 import pygame
 import numpy as np
 from pydub import AudioSegment
-from PIL import Image
+from PIL import Image, ImageEnhance
+
+# Networking
+import requests 
 
 # Metadata
 from mutagen import File as MutagenFile
@@ -61,6 +64,7 @@ class AudioEngine:
             if f and hasattr(f, 'info'):
                 self.duration_sec = f.info.length
             
+            # 仅读取前20秒，优化性能
             audio = AudioSegment.from_file(path)
             if len(audio) > 20000: audio = audio[:20000] 
             self.frame_rate = audio.frame_rate
@@ -134,7 +138,7 @@ class NeonPlayer(App):
     }
 
     #album-art { 
-        height: auto; max-height: 22; width: auto;
+        height: auto; max-height: 24; width: auto;
         border: heavy #333333; margin-bottom: 1; 
         text-align: center; background: #000000; color: #00ff9d;
     }
@@ -264,7 +268,7 @@ class NeonPlayer(App):
             self.is_playing = True
             self.query_one("#btn-play").label = "PAUSE"
             self.current_metadata = {"title": path.stem, "artist": "Loading...", "album": ""}
-            self.query_one("#album-art").update("") 
+            self.query_one("#album-art").update("\n\nLoading...") 
             self.process_heavy_tasks(path)
 
     def action_next_song(self):
@@ -276,13 +280,19 @@ class NeonPlayer(App):
     @work(thread=True)
     def process_heavy_tasks(self, path):
         self.audio.background_analyze(path)
-        self.extract_metadata_and_cover(path)
+        self.extract_and_fetch_cover(path)
 
-    def extract_metadata_and_cover(self, path):
+    def extract_and_fetch_cover(self, path):
+        """
+        三级策略:
+        1. 尝试读取本地 ID3 封面
+        2. 如果失败，尝试在线 (iTunes API) 搜索封面
+        3. 如果失败，生成随机 Hash 像素画
+        """
         try:
             f = MutagenFile(path)
             title = path.stem
-            artist = "Unknown Artist"
+            artist = "Unknown"
             album = "-"
             
             # 1. 提取文本
@@ -302,41 +312,78 @@ class NeonPlayer(App):
             
             self.current_metadata = {"title": title, "artist": artist, "album": album}
 
-            # 2. 提取封面 (你的诊断结果表明 getall('APIC') 可行)
+            # 2. 尝试本地封面
             artwork_data = None
-            
             if str(path).lower().endswith(".mp3"):
                 try:
                     audio_id3 = ID3(path)
                     apic_frames = audio_id3.getall("APIC")
-                    if apic_frames:
-                        artwork_data = apic_frames[0].data
-                except Exception: pass
+                    if apic_frames: artwork_data = apic_frames[0].data
+                except: pass
 
             if not artwork_data and str(path).lower().endswith(".flac"):
-                if hasattr(f, 'pictures') and f.pictures:
-                    artwork_data = f.pictures[0].data
+                if hasattr(f, 'pictures') and f.pictures: artwork_data = f.pictures[0].data
 
-            # 3. 渲染
+            # 3. 如果本地没有，尝试在线获取 (iTunes API)
+            if not artwork_data:
+                self.call_from_thread(self.query_one("#album-art").update, "\n\nSearching Online...")
+                artwork_data = self.fetch_online_cover(artist, title)
+
+            # 4. 渲染 (如果找到)
             if artwork_data:
                 try:
                     img = Image.open(io.BytesIO(artwork_data)).convert("RGB")
+                    # 增加一点对比度，让像素画更清晰
+                    enhancer = ImageEnhance.Contrast(img)
+                    img = enhancer.enhance(1.2)
                     self.render_high_res_ascii(img)
                 except Exception as e:
-                    # 渲染失败则生成随机图
+                    print(f"Render Err: {e}")
                     self.generate_procedural_art(title)
             else:
+                # 5. 兜底 (Hash Art)
                 self.generate_procedural_art(title)
 
         except Exception as e:
-            self.current_metadata = {"title": path.stem, "artist": "Error", "album": ""}
+            print(f"Meta Error: {e}")
             self.generate_procedural_art(path.stem)
 
+    def fetch_online_cover(self, artist, title):
+        """利用 iTunes Search API 搜索高清封面"""
+        if artist == "Unknown" or not title: return None
+        
+        try:
+            term = f"{artist} {title}"
+            url = "https://itunes.apple.com/search"
+            params = {
+                "term": term,
+                "media": "music",
+                "entity": "song",
+                "limit": 1
+            }
+            # 设置超时防止卡住
+            resp = requests.get(url, params=params, timeout=5)
+            data = resp.json()
+            
+            if data['resultCount'] > 0:
+                # 获取 100x100 的缩略图链接
+                thumb_url = data['results'][0]['artworkUrl100']
+                # iTunes 的小彩蛋：把链接里的 100x100 换成 600x600 就能拿到高清图
+                hq_url = thumb_url.replace("100x100", "600x600")
+                
+                img_resp = requests.get(hq_url, timeout=5)
+                if img_resp.status_code == 200:
+                    return img_resp.content
+        except Exception as e:
+            print(f"Online Fetch Error: {e}")
+        return None
+
     def generate_procedural_art(self, text):
+        """兜底：基于Hash生成随机像素画"""
         seed = int(hashlib.sha256(text.encode('utf-8')).hexdigest(), 16)
         rng = random.Random(seed)
         hex_c = f"#{rng.randint(50,255):02x}{rng.randint(50,255):02x}{rng.randint(50,255):02x}"
-        w, h = 44, 20
+        w, h = 48, 22
         lines = []
         for _ in range(h):
             line = ""
@@ -346,14 +393,16 @@ class NeonPlayer(App):
             lines.append(line)
         self.call_from_thread(self.update_cover_ui, "\n".join(lines), hex_c)
 
-    # === [关键修复] 使用十六进制颜色代码 ===
     def render_high_res_ascii(self, img):
         try:
-            w_char, h_char = 44, 20 
+            # 稍微调大一点分辨率以适应容器
+            w_char, h_char = 48, 22 
+            
+            # 使用 LANCZOS 滤镜进行高质量缩放
             img = img.resize((w_char, h_char * 2), Image.Resampling.LANCZOS)
             pixels = img.load()
             
-            # 计算主色调
+            # 提取主色
             center_px = img.getpixel((w_char//2, h_char))
             main_color = f"#{center_px[0]:02x}{center_px[1]:02x}{center_px[2]:02x}"
 
@@ -362,18 +411,15 @@ class NeonPlayer(App):
                 for x in range(w_char):
                     top = pixels[x, y]
                     bot = pixels[x, y+1]
-                    # 修复点：强制使用 #RRGGBB 格式
                     top_hex = f"#{top[0]:02x}{top[1]:02x}{top[2]:02x}"
                     bot_hex = f"#{bot[0]:02x}{bot[1]:02x}{bot[2]:02x}"
-                    # 修复点：使用标准的 Rich 风格语法
                     textual_str += f"[{top_hex} on {bot_hex}]▀[/]"
                 textual_str += "\n"
 
             self.call_from_thread(self.update_cover_ui, textual_str, main_color)
             
         except Exception as e:
-            # 如果出错，显示红色的 ERROR
-            self.call_from_thread(self.update_cover_ui, f"\n\n[red bold]RENDER ERROR:\n{str(e)[:20]}...[/]", "#ff0000")
+            self.call_from_thread(self.update_cover_ui, f"\n\n[red]RENDER ERROR[/]", "#ff0000")
 
     def update_cover_ui(self, art_str, theme_color):
         self.query_one("#album-art").update(art_str)
