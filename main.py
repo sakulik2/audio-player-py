@@ -6,6 +6,7 @@ import hashlib
 import tempfile
 import threading
 import math
+import argparse  # 新增：用于解析命令行参数
 from pathlib import Path
 
 # UI
@@ -30,17 +31,14 @@ import requests
 from mutagen import File as MutagenFile
 from mutagen.id3 import ID3 
 
-# --- 路径配置 ---
-MUSIC_DIR = Path("J:\音乐\Hitorie")
-# ----------------
-
+# 配色
 THEME_COLOR = "#00ff9d" 
 
+# === 1. 修复后的音频引擎 (频谱完美版) ===
 class AudioEngine:
     def __init__(self):
         pygame.mixer.init(frequency=44100)
         self.raw_data = None
-        # 默认 11025，防止未加载时计算出错
         self.frame_rate = 11025 
         self.duration_sec = 0
         self.analyzing = False
@@ -57,7 +55,6 @@ class AudioEngine:
             print(f"Play Error: {e}")
 
     def get_current_time(self):
-        # 增加容错：如果 Pygame 返回 -1 (出错或停止)，则不更新时间
         pos = pygame.mixer.music.get_pos()
         if pos < 0: return self.start_offset
         return self.start_offset + (pos / 1000.0)
@@ -70,14 +67,11 @@ class AudioEngine:
             if f and hasattr(f, 'info'):
                 self.duration_sec = f.info.length
             
-            # 降采样到 11k 以减少计算压力，同时保留低频特征
+            # 降采样到 11k 全量加载
             audio = AudioSegment.from_file(path)
             audio = audio.set_frame_rate(11025).set_channels(1)
-            
             self.frame_rate = 11025
-            # 转为 float 类型方便后续数学运算
             self.raw_data = np.array(audio.get_array_of_samples(), dtype=np.float32)
-            
         except Exception as e:
             print(f"Analyze Error: {e}")
             self.fallback_mode = True
@@ -85,67 +79,42 @@ class AudioEngine:
             self.analyzing = False
 
     def get_spectrum(self, bars=60):
-        # 1. 正在加载或失败时的兜底动画
         if self.analyzing:
             return [random.randint(1, 3) for _ in range(bars)]
         if self.fallback_mode or self.raw_data is None:
-            # 模拟一个正弦波，防止界面空着
             t = time.time()
             return [int(abs(math.sin(t * 3 + i * 0.2)) * 6) + 1 for i in range(bars)]
 
-        # 2. 计算当前索引
         current_time = self.get_current_time()
         idx = int(current_time * self.frame_rate)
-        
-        # 窗口大小：越大越平滑，越小越灵敏
         chunk_size = 2048 
         
-        # 安全检查：防止索引越界导致“消失”
-        if idx >= len(self.raw_data):
-            return [0] * bars
+        if idx >= len(self.raw_data): return [0] * bars
         
-        # 截取音频片段
         end_idx = min(idx + chunk_size, len(self.raw_data))
         chunk = self.raw_data[idx:end_idx]
         
         if len(chunk) == 0: return [0] * bars
 
-        # 3. 核心算法修正：解决“爆表成实心条”的问题
-        # 将片段分成 bars 份
         step = max(1, len(chunk) // bars)
         res = []
-        
         for i in range(bars):
             start = i * step
             end = start + step
             if start >= len(chunk): break
-            
-            # 取该频段的绝对值平均音量
             segment = chunk[start:end]
-            if len(segment) == 0: 
-                val = 0
-            else:
-                val = np.mean(np.abs(segment))
+            val = np.mean(np.abs(segment)) if len(segment) > 0 else 0
             
-            # === 关键修正：非线性映射 ===
-            # 16bit音频最大值约 32768。
-            # 我们先归一化到 0.0 - 1.0
+            # 非线性映射 + 钳位
             normalized = val / 32768.0
-            
-            # 使用平方根函数 (Sqrt) 来提升低音量的可见度，压制高音量
-            # 乘以 2.5 是增益系数，你可以调大这个数让频谱跳得更高
             height = (normalized ** 0.5) * 20 
-            
-            # 限制在 0-8 之间 (Sparkline 的显示范围)
             clamped = max(0, min(int(height), 8))
             res.append(clamped)
             
-        # 补齐长度（防止数组长度不足报错）
-        while len(res) < bars:
-            res.append(0)
-            
+        while len(res) < bars: res.append(0)
         return res
 
+# === 2. UI 组件 ===
 class ManualProgressBar(Label):
     def __init__(self, **kwargs):
         super().__init__("", **kwargs)
@@ -169,55 +138,89 @@ class ManualProgressBar(Label):
 
 class NeonPlayer(App):
     CSS = """
-    Screen { layout: horizontal; background: #0f0f0f; }
+    /* 1. 移除 layout: horizontal，由 dock 决定布局 */
+    Screen { background: #0f0f0f; }
     
+    /* 2. 侧边栏：改为 solid 实线边框 */
     #sidebar { 
-        width: 30; height: 100%; 
-        background: #141414; 
-        border-right: vkey #333333; 
         dock: left;
+        width: 30; 
+        height: 100%; 
+        background: #141414; 
+        border-right: solid #333333; 
     }
+    
     .list-header { 
         padding: 1; text-align: center; text-style: bold; 
         background: #1a1a1a; color: #888888; 
     }
+    
     ListView { background: #141414; }
     ListItem { padding: 1 2; color: #aaaaaa; }
     ListItem:hover { background: #222222; }
     ListItem.-selected { background: #1a1a1a; color: #00ff9d; border-left: solid #00ff9d; }
 
-    #main-view { width: 1fr; height: 100%; }
-
-    #info-container {
-        width: 100%; height: 1fr; 
-        align: center middle; padding: 1;
-        overflow: hidden; 
+    /* 3. 主视图：明确垂直布局，防止混乱 */
+    #main-view { 
+        width: 1fr; 
+        height: 100%; 
+        layout: vertical;
+        overflow: hidden; /* 防止内容溢出屏幕 */
     }
 
+    #info-container {
+        width: 100%; 
+        height: 1fr; /* 占据剩余空间 */
+        align: center middle; 
+        padding: 1;
+    }
+
+    /* 限制封面最大高度，防止把底部控件挤出去 */
     #album-art { 
-        height: auto; max-height: 22; width: auto;
-        border: heavy #333333; margin-bottom: 1; 
-        text-align: center; background: #000000; color: #00ff9d;
+        height: auto; 
+        max-height: 22; 
+        width: auto;
+        border: heavy #333333; 
+        margin-bottom: 1; 
+        text-align: center; 
+        background: #000000; 
+        color: #00ff9d;
     }
 
     #meta-title { text-style: bold; color: #ffffff; text-align: center; }
     #meta-artist { color: #00ff9d; text-align: center; margin-bottom: 1; }
     #meta-album { color: #666666; text-align: center; text-style: italic; display: none; }
 
+    /* 底部面板：固定在底部 */
     #bottom-pane {
-        dock: bottom; height: auto;
-        background: #0f0f0f; padding: 1 4;
+        dock: bottom; 
+        height: auto;
+        background: #0f0f0f; 
+        padding: 1 4;
         border-top: solid #222222;
     }
 
     #time-label { color: #555555; text-align: right; width: 100%; }
+    
+    /* 进度条高度固定 */
     ManualProgressBar { width: 100%; height: 1; margin: 0; }
     Sparkline { height: 3; width: 100%; margin: 1 0; color: #00ff9d; opacity: 60%; }
     
-    #controls { layout: horizontal; align: center middle; height: 3; margin-top: 1; }
+    #controls { 
+        layout: horizontal; 
+        align: center middle; 
+        height: 3; 
+        margin-top: 1; 
+    }
+    
     Button {
-        min-width: 14; height: 3; margin: 0 1; border: none;
-        background: #222222; color: #eeeeee;
+        min-width: 14; 
+        height: 3; 
+        margin: 0 1; 
+        border: none;
+        background: #222222; 
+        color: #eeeeee;
+        content-align: center middle; /* 确保文字居中 */
     }
     Button:hover { background: #00ff9d; color: #000000; }
     #btn-play { background: #2a2a2a; border: solid #00ff9d; }
@@ -232,8 +235,10 @@ class NeonPlayer(App):
     current_metadata = reactive({"title": "Waiting...", "artist": "-", "album": "-"})
     current_cover_bytes = None
 
-    def __init__(self):
+    # === 3. 构造函数接收路径参数 ===
+    def __init__(self, music_dir):
         super().__init__()
+        self.music_dir = Path(music_dir).resolve() # 转为绝对路径
         self.audio = AudioEngine()
         self.playlist = []
         self.current_idx = -1
@@ -242,7 +247,9 @@ class NeonPlayer(App):
 
     def compose(self) -> ComposeResult:
         with Container(id="sidebar"):
-            yield Label("P L A Y L I S T", classes="list-header")
+            # 显示当前扫描的文件夹名
+            folder_name = self.music_dir.name if self.music_dir.name else "ROOT"
+            yield Label(f"DIR: {folder_name}", classes="list-header")
             yield ListView(id="track-list")
         
         with Container(id="main-view"):
@@ -266,17 +273,23 @@ class NeonPlayer(App):
         self.load_files()
         self.set_interval(0.1, self.update_ui_tick)
 
+    # === 4. 加载逻辑使用 self.music_dir ===
     def load_files(self):
         lv = self.query_one("#track-list", ListView)
-        if MUSIC_DIR.exists():
-            files = [p for p in MUSIC_DIR.glob("*") if p.suffix.lower() in ['.mp3', '.flac', '.wav']]
+        if self.music_dir.exists() and self.music_dir.is_dir():
+            files = [p for p in self.music_dir.glob("*") if p.suffix.lower() in ['.mp3', '.flac', '.wav', '.ogg']]
             files.sort(key=lambda x: x.name)
+            
+            if not files:
+                self.notify(f"No music found in {self.music_dir}", severity="error")
+            
             for f in files:
                 self.playlist.append(f)
                 lv.append(ListItem(Label(f" {f.name}")))
+        else:
+            self.notify(f"Invalid Directory: {self.music_dir}", severity="error")
 
     def update_ui_tick(self):
-        # 频谱现在由 AudioEngine 保证永远返回有效列表
         data = self.audio.get_spectrum(bars=90)
         self.query_one("#spectrum", Sparkline).data = data
 
@@ -342,7 +355,6 @@ class NeonPlayer(App):
         if self.current_cover_bytes:
             threading.Thread(target=self._open_image_file, args=(self.current_cover_bytes,)).start()
         else:
-            # 使用 Textual 的 notify 显示优雅的提示
             self.notify("No cover image available", severity="warning")
 
     def _open_image_file(self, data):
@@ -356,7 +368,6 @@ class NeonPlayer(App):
 
     @work(thread=True)
     def process_heavy_tasks(self, path):
-        # 并行执行: 一个线程分析音频，一个提取封面
         self.audio.background_analyze(path)
         self.extract_and_fetch_cover(path)
 
@@ -496,6 +507,19 @@ class NeonPlayer(App):
             self.query_one("#btn-play").label = "PAUSE"
             self.is_playing = True
 
+# === 5. 主程序入口解析参数 ===
 if __name__ == "__main__":
-    app = NeonPlayer()
+    # 创建参数解析器
+    parser = argparse.ArgumentParser(description="Neon TUI Music Player")
+    parser.add_argument(
+        "path", 
+        nargs="?",  # 可选参数
+        default=".", # 默认值为当前目录
+        help="Path to the music directory (default: current folder)"
+    )
+    
+    args = parser.parse_args()
+    
+    # 启动应用，传入路径
+    app = NeonPlayer(music_dir=args.path)
     app.run()
