@@ -15,7 +15,7 @@ from textual.containers import Container, Vertical, Horizontal
 from textual.widgets import Header, Footer, ListView, ListItem, Label, Button, Sparkline
 from textual import on, work
 from textual.binding import Binding
-from textual.events import Click
+from textual.events import Click, Resize
 from textual.reactive import reactive
 
 # Audio & Data
@@ -34,8 +34,7 @@ from mutagen.id3 import ID3
 # 配色
 THEME_COLOR = "#00ff9d" 
 
-# === 1. 性能优化后的音频引擎 ===
-# === 1. 修复后的音频引擎 (补全缺失属性) ===
+# === 1. 音频引擎 (保持稳定版) ===
 class AudioEngine:
     def __init__(self):
         pygame.mixer.init(frequency=44100)
@@ -46,12 +45,10 @@ class AudioEngine:
         self.start_offset = 0
         self.fallback_mode = False
         self.chunk_size = 2048
-        # [关键修复]：补回漏掉的 current_file 属性
         self.current_file = None 
 
     def load_and_play(self, path, start_time=0):
         self.start_offset = start_time
-        # [关键修复]：播放时记录当前文件路径
         self.current_file = path 
         try:
             pygame.mixer.music.load(path)
@@ -75,13 +72,12 @@ class AudioEngine:
             if f and hasattr(f, 'info'):
                 self.duration_sec = f.info.length
             
-            # 极速加载逻辑
             audio = AudioSegment.from_file(path)
             audio = audio.set_frame_rate(11025).set_channels(1)
             self.frame_rate = 11025
             self.raw_data = np.frombuffer(audio.raw_data, dtype=np.int16).astype(np.float32)
             
-        except Exception as e:
+        except Exception:
             self.fallback_mode = True
         finally:
             self.analyzing = False
@@ -118,10 +114,9 @@ class AudioEngine:
                 res.append(max(0, min(int(height), 8)))
             else:
                 res.append(0)
-            
         return res
 
-# === UI 组件保持不变 ===
+# === UI 组件 ===
 class ManualProgressBar(Label):
     def __init__(self, **kwargs):
         super().__init__("", **kwargs)
@@ -144,7 +139,6 @@ class ManualProgressBar(Label):
         self.app.on_seek_request(pct)
 
 class NeonPlayer(App):
-    # [修复后的 CSS]：移除了冲突的 layout 属性，使用了 solid 边框
     CSS = """
     Screen { background: #0f0f0f; }
     
@@ -171,29 +165,49 @@ class NeonPlayer(App):
         overflow: hidden; 
     }
 
+    /* 动态容器 */
     #info-container {
-        width: 100%; height: 1fr; 
-        align: center middle; padding: 1;
+        width: 100%; 
+        height: 1fr; 
+        align: center middle; 
+        padding: 0 1; /* 左右留一点空隙 */
+        overflow: hidden; /* 溢出隐藏是必要的，防止撑破布局 */
     }
 
+    /* 封面图 */
     #album-art { 
-        height: auto; max-height: 22; width: auto;
-        border: heavy #333333; margin-bottom: 1; 
-        text-align: center; background: #000000; color: #00ff9d;
+        height: auto; 
+        width: auto;
+        border: heavy #333333; 
+        margin-bottom: 1; /* 底部留出 1 行间距给文字 */
+        text-align: center; 
+        background: #000000; 
+        color: #00ff9d;
+        /* 关键：防止封面无限撑大 */
+        box-sizing: border-box; 
+    }
+
+    /* 元数据区域：固定最小高度，防止被挤压成 0 */
+    #meta-box {
+        height: auto;
+        min-height: 4; 
+        align: center middle;
     }
 
     #meta-title { text-style: bold; color: #ffffff; text-align: center; }
-    #meta-artist { color: #00ff9d; text-align: center; margin-bottom: 1; }
+    #meta-artist { color: #00ff9d; text-align: center; }
     #meta-album { color: #666666; text-align: center; text-style: italic; display: none; }
 
     #bottom-pane {
-        dock: bottom; height: auto;
-        background: #0f0f0f; padding: 1 4;
+        dock: bottom; 
+        height: auto; 
+        min-height: 9; 
+        background: #0f0f0f; 
+        padding: 1 4;
         border-top: solid #222222;
     }
 
     #time-label { color: #555555; text-align: right; width: 100%; }
-    
     ManualProgressBar { width: 100%; height: 1; margin: 0; }
     Sparkline { height: 3; width: 100%; margin: 1 0; color: #00ff9d; opacity: 60%; }
     
@@ -218,6 +232,9 @@ class NeonPlayer(App):
     ]
 
     current_metadata = reactive({"title": "Waiting...", "artist": "-", "album": "-"})
+    
+    # 核心数据
+    current_pil_image = None
     current_cover_bytes = None
 
     def __init__(self, music_dir):
@@ -228,6 +245,7 @@ class NeonPlayer(App):
         self.current_idx = -1
         self.is_playing = False
         self.is_seeking = False
+        self._resize_timer = None
 
     def compose(self) -> ComposeResult:
         with Container(id="sidebar"):
@@ -238,9 +256,10 @@ class NeonPlayer(App):
         with Container(id="main-view"):
             with Vertical(id="info-container"):
                 yield Label("", id="album-art")
-                yield Label("No Track Selected", id="meta-title")
-                yield Label("-", id="meta-artist")
-                yield Label("-", id="meta-album")
+                with Vertical(id="meta-box"):
+                    yield Label("No Track Selected", id="meta-title")
+                    yield Label("-", id="meta-artist")
+                    yield Label("-", id="meta-album")
 
             with Vertical(id="bottom-pane"):
                 yield Label("00:00 / 00:00", id="time-label")
@@ -254,9 +273,79 @@ class NeonPlayer(App):
 
     def on_mount(self):
         self.load_files()
-        # [性能优化点 3]：将刷新率从 0.1 (10fps) 提升到 0.05 (20fps)
-        # 因为 AudioEngine 优化了，现在跑快点也不会卡
         self.set_interval(0.05, self.update_ui_tick)
+
+    # === [优化] 响应式布局：主线程计算尺寸 -> 子线程生成图片 ===
+    def on_resize(self, event: Resize):
+        if self._resize_timer:
+            self._resize_timer.stop()
+        # 防抖：300ms 后执行重绘
+        self._resize_timer = self.set_timer(0.3, self.trigger_render_pipeline)
+
+    def trigger_render_pipeline(self):
+        """主线程任务：计算可用空间，然后派发给 Worker"""
+        if not self.current_pil_image:
+            return
+
+        # 1. 计算尺寸 (必须在主线程)
+        screen_height = self.size.height
+        
+        # === [核心修复] ===
+        # 屏幕总高 
+        # - Header(1) - Footer(1) 
+        # - BottomPane(9) (底部控制区)
+        # - MetaBox(5) (预留给文字区域: 标题+歌手+专辑+Padding)
+        # - Padding(2) (容器内边距)
+        # - Border(2) (封面边框)
+        # = 剩余给图片像素的高度
+        # ------------------------------------------------
+        # 算式：Screen - (1+1+9+5+2+2) = Screen - 20
+        # 为了保险起见，我们减去 24，留出更多“呼吸空间”
+        available_h = screen_height - 24
+        
+        # 限制高度范围：最小 4 行，最大 28 行
+        # 如果 available_h <= 0，说明窗口太小了，强行给 4 行显示个大概
+        target_h = max(4, min(available_h, 28))
+        
+        # 宽度比例 2.2 倍
+        target_w = int(target_h * 2.2)
+
+        # 2. 派发给后台线程
+        self.run_worker(self.render_worker_task(self.current_pil_image, target_w, target_h), thread=True)
+
+    async def render_worker_task(self, img, w, h):
+        """Worker任务：执行缩放和字符生成"""
+        try:
+            # 缩放 (耗时操作)
+            img_resized = img.resize((w, h * 2), Image.Resampling.BILINEAR)
+            pixels = img_resized.load()
+            
+            center_px = img.getpixel((img.width//2, img.height//2))
+            main_color = f"#{center_px[0]:02x}{center_px[1]:02x}{center_px[2]:02x}"
+
+            lines = []
+            for y in range(0, h * 2, 2):
+                row_parts = []
+                for x in range(w):
+                    # 安全检查，防止越界
+                    if x >= img_resized.width or y+1 >= img_resized.height:
+                        continue
+                    
+                    top = pixels[x, y]
+                    bot = pixels[x, y+1]
+                    top_hex = f"#{top[0]:02x}{top[1]:02x}{top[2]:02x}"
+                    bot_hex = f"#{bot[0]:02x}{bot[1]:02x}{bot[2]:02x}"
+                    row_parts.append(f"[{top_hex} on {bot_hex}]▀[/]")
+                lines.append("".join(row_parts))
+            
+            final_str = "\n".join(lines)
+            
+            # 回到主线程更新 UI
+            self.call_from_thread(self.update_cover_ui, final_str, main_color)
+            
+        except Exception as e:
+            # print(f"Render Error: {e}") # 调试用
+            self.call_from_thread(self.update_cover_ui, f"[red]Render Error:\n{str(e)}[/]", "#ff0000")
 
     def load_files(self):
         lv = self.query_one("#track-list", ListView)
@@ -271,7 +360,6 @@ class NeonPlayer(App):
             self.notify(f"Invalid Directory: {self.music_dir}", severity="error")
 
     def update_ui_tick(self):
-        # 即使计算快，Sparkline 渲染也需要时间，90个柱子足够了
         data = self.audio.get_spectrum(bars=90)
         self.query_one("#spectrum", Sparkline).data = data
 
@@ -350,13 +438,13 @@ class NeonPlayer(App):
 
     @work(thread=True)
     def process_heavy_tasks(self, path):
-        # 1. 先分析音频 (本地文件，较快)
         self.audio.background_analyze(path)
-        # 2. 再搞封面 (可能涉及网络，较慢)
         self.extract_and_fetch_cover(path)
 
     def extract_and_fetch_cover(self, path):
-        self.current_cover_bytes = None 
+        self.current_cover_bytes = None
+        self.current_pil_image = None
+        
         try:
             f = MutagenFile(path)
             title = path.stem
@@ -399,7 +487,9 @@ class NeonPlayer(App):
                     img = Image.open(io.BytesIO(artwork_data)).convert("RGB")
                     enhancer = ImageEnhance.Contrast(img)
                     img = enhancer.enhance(1.2)
-                    self.render_high_res_ascii(img)
+                    self.current_pil_image = img
+                    # [关键修复] 调用主线程触发渲染管线
+                    self.call_from_thread(self.trigger_render_pipeline)
                 except:
                     self.generate_procedural_art(title)
             else:
@@ -414,7 +504,6 @@ class NeonPlayer(App):
             term = f"{artist} {title}"
             url = "https://itunes.apple.com/search"
             params = {"term": term, "media": "music", "entity": "song", "limit": 1}
-            # 设置短超时，防止网络卡顿影响 UI
             resp = requests.get(url, params=params, timeout=3)
             data = resp.json()
             if data['resultCount'] > 0:
@@ -430,7 +519,7 @@ class NeonPlayer(App):
         seed = int(hashlib.sha256(text.encode('utf-8')).hexdigest(), 16)
         rng = random.Random(seed)
         hex_c = f"#{rng.randint(50,255):02x}{rng.randint(50,255):02x}{rng.randint(50,255):02x}"
-        w, h = 48, 22
+        w, h = 48, 20
         lines = []
         for _ in range(h):
             line = ""
@@ -439,33 +528,6 @@ class NeonPlayer(App):
                 else: line += " "
             lines.append(line)
         self.call_from_thread(self.update_cover_ui, "\n".join(lines), hex_c)
-
-    # === [性能优化点 4]：优化 ASCII 渲染循环 ===
-    def render_high_res_ascii(self, img):
-        try:
-            w_char, h_char = 48, 22 
-            # 1. 降级为 BILINEAR，速度比 LANCZOS 快很多，像素画看不出区别
-            img = img.resize((w_char, h_char * 2), Image.Resampling.BILINEAR)
-            pixels = img.load()
-            center_px = img.getpixel((w_char//2, h_char))
-            main_color = f"#{center_px[0]:02x}{center_px[1]:02x}{center_px[2]:02x}"
-
-            # 2. 使用 list append + join 替代字符串拼接，减少内存拷贝
-            lines = []
-            for y in range(0, h_char * 2, 2):
-                row_parts = []
-                for x in range(w_char):
-                    top = pixels[x, y]
-                    bot = pixels[x, y+1]
-                    top_hex = f"#{top[0]:02x}{top[1]:02x}{top[2]:02x}"
-                    bot_hex = f"#{bot[0]:02x}{bot[1]:02x}{bot[2]:02x}"
-                    row_parts.append(f"[{top_hex} on {bot_hex}]▀[/]")
-                lines.append("".join(row_parts))
-            
-            final_str = "\n".join(lines)
-            self.call_from_thread(self.update_cover_ui, final_str, main_color)
-        except:
-            self.call_from_thread(self.update_cover_ui, "[red]RENDER ERR[/]", "#ff0000")
 
     def update_cover_ui(self, art_str, theme_color):
         self.query_one("#album-art").update(art_str)
