@@ -25,7 +25,6 @@ from textual.reactive import reactive
 import pygame
 import numpy as np
 from pydub import AudioSegment
-# [新增] ImageDraw 用于生成随机像素图
 from PIL import Image, ImageEnhance, ImageDraw 
 
 # Networking
@@ -37,10 +36,10 @@ from mutagen.id3 import ID3
 from mutagen.easyid3 import EasyID3 
 from mutagen.flac import FLAC
 
-# 配色
+# Color
 THEME_COLOR = "#00ff9d" 
 
-# === 1. 音频引擎 ===
+# === 1. AudioEngine ===
 class AudioEngine:
     def __init__(self):
         pygame.mixer.init(frequency=44100)
@@ -121,7 +120,7 @@ class AudioEngine:
                 res.append(0)
         return res
 
-# === UI 组件 ===
+# === UI ===
 class ManualProgressBar(Label):
     def __init__(self, **kwargs):
         super().__init__("", **kwargs)
@@ -176,7 +175,6 @@ class NeonPlayer(App):
         position: relative; 
     }
 
-    /* 封面：box-sizing 确保边框包含在尺寸内 */
     #album-art { 
         height: auto; 
         width: auto;
@@ -186,7 +184,6 @@ class NeonPlayer(App):
         margin-bottom: 5; 
     }
 
-    /* 将文字区域“钉”在容器底部，防止被封面挤出去 */
     #meta-box {
         dock: bottom;
         height: auto;
@@ -277,7 +274,6 @@ class NeonPlayer(App):
         self.load_files()
         self.set_interval(0.05, self.update_ui_tick)
 
-    # === [优化] 布局逻辑 ===
     def on_resize(self, event: Resize):
         if self._resize_timer: self._resize_timer.stop()
         self._resize_timer = self.set_timer(0.3, self.trigger_render_pipeline)
@@ -285,12 +281,9 @@ class NeonPlayer(App):
     def trigger_render_pipeline(self):
         if not self.current_pil_image: return
         screen_height = self.size.height
-        
-        # [调整] 安全余量：Screen - Bottom(9) - Header(1) - Footer(1) - Meta(5) - Padding(2) = 18
-        # 我们减去 23，给封面更多空间
+
         available_h = screen_height - 23
         
-        # 允许更大的封面，最小保证 4 行
         target_h = max(4, min(available_h, 40)) 
         target_w = int(target_h * 2.2)
 
@@ -299,11 +292,9 @@ class NeonPlayer(App):
     @work(thread=True)
     def render_worker_task(self, img, w, h):
         try:
-            # BILINEAR 速度快且平滑
             img_resized = img.resize((w, h * 2), Image.Resampling.BILINEAR)
             pixels = img_resized.load()
             
-            # 取中心色作为主题色
             center_px = img.getpixel((img.width//2, img.height//2))
             main_color = f"#{center_px[0]:02x}{center_px[1]:02x}{center_px[2]:02x}"
             
@@ -403,7 +394,7 @@ class NeonPlayer(App):
         else:
             self.notify("No cover image available", severity="warning")
     
-    # === Auto Tag 功能 ===
+    # === Auto Tag ===
     def action_auto_tag(self):
         if not self.audio.current_file: return
         self.notify("Searching online metadata...", severity="information")
@@ -426,13 +417,10 @@ class NeonPlayer(App):
                 new_album = track.get('collectionName', '')
                 thumb_url = track.get('artworkUrl100', '')
                 
-                # 1. 写入文本标签
                 self.write_tags_to_file(path, new_title, new_artist, new_album)
                 
-                # 2. 更新 UI 文本
                 self.call_from_thread(self.update_metadata_ui, new_title, new_artist, new_album)
                 
-                # 3. [核心修复] 如果有封面 URL，立即下载并更新 UI
                 if thumb_url:
                     hq_url = thumb_url.replace("100x100", "600x600")
                     img_resp = requests.get(hq_url, timeout=5)
@@ -444,7 +432,6 @@ class NeonPlayer(App):
                         enhancer = ImageEnhance.Contrast(img)
                         img = enhancer.enhance(1.2)
                         
-                        # 更新当前图片状态，并触发渲染
                         self.current_pil_image = img
                         self.call_from_thread(self.trigger_render_pipeline)
 
@@ -500,7 +487,6 @@ class NeonPlayer(App):
             artist = "Unknown"
             album = "-"
             
-            # 提取文本
             if f and f.tags:
                 def get_text(k):
                     if k in f.tags:
@@ -517,7 +503,6 @@ class NeonPlayer(App):
             
             self.current_metadata = {"title": title, "artist": artist, "album": album}
 
-            # 提取封面
             artwork_data = None
             if str(path).lower().endswith(".mp3"):
                 try:
@@ -528,12 +513,10 @@ class NeonPlayer(App):
             if not artwork_data and str(path).lower().endswith(".flac"):
                 if hasattr(f, 'pictures') and f.pictures: artwork_data = f.pictures[0].data
 
-            # 在线搜索 fallback
             if not artwork_data:
                 self.call_from_thread(self.query_one("#album-art").update, "\n\nSearching Online...")
                 artwork_data = self.fetch_online_cover(artist, title)
 
-            # 统一处理图片 (无论是本地提取的还是在线下载的)
             if artwork_data:
                 self.current_cover_bytes = artwork_data
                 try:
@@ -567,28 +550,23 @@ class NeonPlayer(App):
         except: pass
         return None
 
-    # === [核心修复] 生成 PIL 图片对象，而不是字符串 ===
     def create_procedural_image(self, text):
         """生成随机像素画作为 PIL Image，走统一的渲染管线，解决吞字和缩放问题"""
         try:
             seed = int(hashlib.sha256(text.encode('utf-8')).hexdigest(), 16)
             rng = random.Random(seed)
             
-            # 创建一个较小的图片，稍后会被放大渲染，形成像素风格
             w, h = 24, 24 
             img = Image.new('RGB', (w, h), color='#000000')
             pixels = img.load()
             
-            # 生成主色调
             base_r = rng.randint(20, 200)
             base_g = rng.randint(20, 200)
             base_b = rng.randint(20, 200)
             
             for y in range(h):
                 for x in range(w):
-                    # 随机生成点
                     if rng.random() > 0.8: 
-                        # 颜色微调
                         r = min(255, base_r + rng.randint(-30, 30))
                         g = min(255, base_g + rng.randint(-30, 30))
                         b = min(255, base_b + rng.randint(-30, 30))
