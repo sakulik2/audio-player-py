@@ -3,3 +3,4 @@
 *.flac
 __pycache__/
 *.m4a
+venv/
